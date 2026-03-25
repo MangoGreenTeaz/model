@@ -422,6 +422,9 @@ class Runner:
         self.le_path = os.path.join(self.soft_label_dir, "le.pkl")
         self.vocab_path = os.path.join(self.soft_label_dir, "vocab.json")
 
+    def _has_validation_data(self) -> bool:
+        return bool(getattr(self, "val_csv_path", None))
+
     def _save_full_mode_splits(self, train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame):
         if not self.full_split_save_dir:
             return
@@ -510,9 +513,6 @@ class Runner:
             raise ValueError("data_mode 仅支持: separate, full")
 
         if self.data_mode == "separate":
-            if not self.val_csv_path:
-                raise ValueError("data_mode=separate 时必须提供 val_csv_path（验证集路径）")
-
             print(f"Loading train data from {self.train_csv_path}")
             df_train = pd.read_csv(self.train_csv_path)
             if "scene_label" not in df_train.columns or "MERGED_TEXT" not in df_train.columns:
@@ -521,13 +521,19 @@ class Runner:
             self.X_train_texts = df_train["MERGED_TEXT"].astype(str).tolist()
             train_labels = df_train["scene_label"].astype(str).tolist()
 
-            print(f"Loading val data from {self.val_csv_path}")
-            df_val = pd.read_csv(self.val_csv_path)
-            if "scene_label" not in df_val.columns or "MERGED_TEXT" not in df_val.columns:
-                raise ValueError("Val CSV 必须包含 scene_label 与 MERGED_TEXT 列")
-            df_val = df_val.dropna(subset=["scene_label", "MERGED_TEXT"])
-            self.X_val_texts = df_val["MERGED_TEXT"].astype(str).tolist()
-            val_labels = df_val["scene_label"].astype(str).tolist()
+            val_csv_path = self.val_csv_path
+            if val_csv_path:
+                print(f"Loading val data from {val_csv_path}")
+                df_val = pd.read_csv(val_csv_path)
+                if "scene_label" not in df_val.columns or "MERGED_TEXT" not in df_val.columns:
+                    raise ValueError("Val CSV 必须包含 scene_label 与 MERGED_TEXT 列")
+                df_val = df_val.dropna(subset=["scene_label", "MERGED_TEXT"])
+                self.X_val_texts = df_val["MERGED_TEXT"].astype(str).tolist()
+                val_labels = df_val["scene_label"].astype(str).tolist()
+            else:
+                print("val_file_path 为空，跳过验证集加载。")
+                self.X_val_texts = []
+                val_labels = []
 
             print(f"Loading test data from {self.test_csv_path}")
             df_test = pd.read_csv(self.test_csv_path)
@@ -585,14 +591,18 @@ class Runner:
                     self.full_train_df = self.full_train_df.loc[mask_tr].reset_index(drop=True)
             self.y_train = self.le.transform(train_labels)
 
-            mask_val = [l in known_labels for l in val_labels]
-            if not all(mask_val):
-                print(f"警告：验证集中发现 {len(mask_val) - sum(mask_val)} 条数据的标签不在旧 LabelEncoder 中，将被忽略。")
-                self.X_val_texts = [t for t, m in zip(self.X_val_texts, mask_val) if m]
-                val_labels = [l for l, m in zip(val_labels, mask_val) if m]
-                if self.data_mode == "full":
-                    self.full_val_df = self.full_val_df.loc[mask_val].reset_index(drop=True)
-            self.y_val = self.le.transform(val_labels)
+            if self._has_validation_data():
+                mask_val = [l in known_labels for l in val_labels]
+                if not all(mask_val):
+                    print(f"警告：验证集中发现 {len(mask_val) - sum(mask_val)} 条数据的标签不在旧 LabelEncoder 中，将被忽略。")
+                    self.X_val_texts = [t for t, m in zip(self.X_val_texts, mask_val) if m]
+                    val_labels = [l for l, m in zip(val_labels, mask_val) if m]
+                    if self.data_mode == "full":
+                        self.full_val_df = self.full_val_df.loc[mask_val].reset_index(drop=True)
+                self.y_val = self.le.transform(val_labels)
+            else:
+                self.X_val_texts = []
+                self.y_val = np.array([], dtype=np.int64)
 
             mask_te = [l in known_labels for l in test_labels]
             if not all(mask_te):
@@ -608,7 +618,7 @@ class Runner:
             all_labels = train_labels + val_labels + test_labels
             self.le.fit(all_labels)
             self.y_train = self.le.transform(train_labels)
-            self.y_val = self.le.transform(val_labels)
+            self.y_val = self.le.transform(val_labels) if val_labels else np.array([], dtype=np.int64)
             self.y_test = self.le.transform(test_labels)
 
         if self.data_mode == "full":
@@ -624,17 +634,22 @@ class Runner:
         )
 
     def train_teacher_and_save_logits(self, epochs: int = 50, lr: float = 1e-3, batch_size: int = 64):
-        if (
-            os.path.exists(self.train_logits_path)
-            and os.path.exists(self.test_logits_path)
-            and os.path.exists(self.val_logits_path)
-        ):
+        has_val = self._has_validation_data()
+        cached_ready = os.path.exists(self.train_logits_path) and os.path.exists(self.test_logits_path)
+        if has_val:
+            cached_ready = cached_ready and os.path.exists(self.val_logits_path)
+
+        if cached_ready:
             print("Soft labels 已存在，跳过教师模型训练。")
             self.kd_train_logits = np.load(self.train_logits_path)
-            self.kd_val_logits = np.load(self.val_logits_path)
             self.kd_test_logits = np.load(self.test_logits_path)
             self.y_train = np.load(self.labels_path).tolist()
-            self.y_val = np.load(self.val_labels_path).tolist()
+            if has_val and os.path.exists(self.val_labels_path):
+                self.kd_val_logits = np.load(self.val_logits_path)
+                self.y_val = np.load(self.val_labels_path).tolist()
+            else:
+                self.kd_val_logits = None
+                self.y_val = []
 
             import pickle
             try:
@@ -656,8 +671,10 @@ class Runner:
         encode_bs = 8
         emb_train = _encode_texts(embedder, self.X_train_texts, encode_bs, desc="Encoding train")
 
-        print("提取 BGEM3 向量 (val)...")
-        emb_val = _encode_texts(embedder, self.X_val_texts, encode_bs, desc="Encoding val")
+        emb_val = None
+        if has_val:
+            print("提取 BGEM3 向量 (val)...")
+            emb_val = _encode_texts(embedder, self.X_val_texts, encode_bs, desc="Encoding val")
 
         print("提取 BGEM3 向量 (test)...")
         emb_test = _encode_texts(embedder, self.X_test_texts, encode_bs, desc="Encoding test")
@@ -666,8 +683,8 @@ class Runner:
 
         Xtr = torch.tensor(emb_train, dtype=torch.float32)
         Ytr = torch.tensor(self.y_train, dtype=torch.long)
-        Xval = torch.tensor(emb_val, dtype=torch.float32)
-        Yval = torch.tensor(self.y_val, dtype=torch.long)
+        Xval = torch.tensor(emb_val, dtype=torch.float32) if emb_val is not None else None
+        Yval = torch.tensor(self.y_val, dtype=torch.long) if has_val else None
         Xte = torch.tensor(emb_test, dtype=torch.float32)
         Yte = torch.tensor(self.y_test, dtype=torch.long)
 
@@ -696,16 +713,22 @@ class Runner:
         teacher.eval()
         with torch.no_grad():
             logits_tr = teacher(Xtr.to(device))
-            logits_val = teacher(Xval.to(device))
             logits_te = teacher(Xte.to(device))
 
-            val_preds = logits_val.argmax(-1)
-            val_acc = (val_preds == Yval.to(device)).float().mean().item()
+            logits_val = teacher(Xval.to(device)) if has_val and Xval is not None else None
+            if has_val and logits_val is not None and Yval is not None:
+                val_preds = logits_val.argmax(-1)
+                val_acc = (val_preds == Yval.to(device)).float().mean().item()
+            else:
+                val_acc = None
 
             preds = logits_te.argmax(-1)
             te_acc = (preds == Yte.to(device)).float().mean().item()
 
-        print(f"[Teacher] Val acc={val_acc:.4f}, Test acc={te_acc:.4f}")
+        if val_acc is None:
+            print(f"[Teacher] Test acc={te_acc:.4f}")
+        else:
+            print(f"[Teacher] Val acc={val_acc:.4f}, Test acc={te_acc:.4f}")
 
         teacher_preds = preds.cpu().numpy()
         teacher_labels = Yte.cpu().numpy()
@@ -722,13 +745,15 @@ class Runner:
         print(f"教师模型权重已保存: {teacher_model_path}")
 
         self.kd_train_logits = logits_tr.cpu().numpy()
-        self.kd_val_logits = logits_val.cpu().numpy()
+        self.kd_val_logits = logits_val.cpu().numpy() if logits_val is not None else None
         self.kd_test_logits = logits_te.cpu().numpy()
         np.save(self.train_logits_path, self.kd_train_logits)
-        np.save(self.val_logits_path, self.kd_val_logits)
+        if self.kd_val_logits is not None:
+            np.save(self.val_logits_path, self.kd_val_logits)
         np.save(self.test_logits_path, self.kd_test_logits)
         np.save(self.labels_path, self.y_train)
-        np.save(self.val_labels_path, self.y_val)
+        if has_val:
+            np.save(self.val_labels_path, self.y_val)
 
         import pickle
         with open(self.le_path, "wb") as f:
@@ -762,11 +787,12 @@ class Runner:
         self.build_tokenizer()
 
         train_ds = TextDataset(self.X_train_texts, self.y_train, self.tokenizer, self.max_len, self.kd_train_logits)
-        val_ds = TextDataset(self.X_val_texts, self.y_val, self.tokenizer, self.max_len, teacher_logits=None)
+        has_val = self._has_validation_data() and len(getattr(self, "X_val_texts", [])) > 0
+        val_ds = TextDataset(self.X_val_texts, self.y_val, self.tokenizer, self.max_len, teacher_logits=None) if has_val else None
         test_ds = TextDataset(self.X_test_texts, self.y_test, self.tokenizer, self.max_len, self.kd_test_logits)
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False) if val_ds is not None else None
 
         student = TinyTransformerForClassification(
             num_labels=self.num_labels,
@@ -808,22 +834,28 @@ class Runner:
                 correct += (s_logits.argmax(-1) == labels).sum().item()
 
             student.eval()
-            val_correct = 0
-            val_total = 0
-            with torch.no_grad():
-                for vbatch in val_loader:
-                    v_ids = vbatch["input_ids"].to(device)
-                    v_attn = vbatch["attention_mask"].to(device)
-                    v_labels = vbatch["label"].to(device)
-                    v_logits, _ = student(v_ids, v_attn)
-                    val_correct += (v_logits.argmax(-1) == v_labels).sum().item()
-                    val_total += v_ids.size(0)
+            if val_loader is not None:
+                val_correct = 0
+                val_total = 0
+                with torch.no_grad():
+                    for vbatch in val_loader:
+                        v_ids = vbatch["input_ids"].to(device)
+                        v_attn = vbatch["attention_mask"].to(device)
+                        v_labels = vbatch["label"].to(device)
+                        v_logits, _ = student(v_ids, v_attn)
+                        val_correct += (v_logits.argmax(-1) == v_labels).sum().item()
+                        val_total += v_ids.size(0)
 
-            val_acc = val_correct / val_total if val_total > 0 else 0.0
-            print(
-                f"[Student] Epoch {ep + 1}/{epochs} "
-                f"loss={loss_sum / total:.4f} train_acc={correct / total:.4f} val_acc={val_acc:.4f}"
-            )
+                val_acc = val_correct / val_total if val_total > 0 else 0.0
+                print(
+                    f"[Student] Epoch {ep + 1}/{epochs} "
+                    f"loss={loss_sum / total:.4f} train_acc={correct / total:.4f} val_acc={val_acc:.4f}"
+                )
+            else:
+                print(
+                    f"[Student] Epoch {ep + 1}/{epochs} "
+                    f"loss={loss_sum / total:.4f} train_acc={correct / total:.4f}"
+                )
 
         self.student = student
         self.test_ds = test_ds
@@ -834,7 +866,7 @@ class Runner:
             print(f"Loading existing vocab from {self.vocab_path}")
             self.tokenizer.load_vocab(self.vocab_path)
         else:
-            all_texts = self.X_train_texts + self.X_val_texts + self.X_test_texts
+            all_texts = self.X_train_texts + getattr(self, "X_val_texts", []) + self.X_test_texts
             self.tokenizer.build_vocab(all_texts)
             self.tokenizer.save_vocab(self.vocab_path)
             print(f"Vocab saved to {self.vocab_path}")
