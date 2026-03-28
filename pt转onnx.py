@@ -1,11 +1,11 @@
 import os
 import math
-import pickle
+import shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import LabelEncoder
-from typing import List, Optional, Literal
+from tqdm import tqdm
+from typing import List, Optional, Literal, Any, Dict
 
 # ======================== 模型结构（与训练时一致） =========================
 # 请确保这些类定义与你训练时使用的完全一致
@@ -47,6 +47,14 @@ class SimpleCNENTokenizer:
         return ids
     @property
     def pad_id(self): return self.token2id["[PAD]"]
+
+    def load_vocab(self, path: str) -> None:
+        import json
+
+        with open(path, "r", encoding="utf-8") as f:
+            self.token2id = json.load(f)
+        self.id2token = {i: tok for tok, i in self.token2id.items()}
+        self.vocab_size = len(self.token2id)
 
 def _get_alibi_slopes(n_heads: int) -> torch.Tensor:
     def get_slopes_power_of_2(n):
@@ -147,84 +155,359 @@ class TinyTransformerForClassification(nn.Module):
         logits = self.classifier(pooled)
         return logits, pooled
 
+# ======================== 转换函数 =========================
+
+def _convert_onnx_to_fp16(src_onnx_path: str, dst_onnx_path: str, keep_io_types: bool = True):
+    import onnx
+    model = onnx.load(src_onnx_path)
+    try:
+        from onnxruntime.transformers.float16 import convert_float_to_float16
+        model_fp16 = convert_float_to_float16(model, keep_io_types=keep_io_types)
+    except Exception:
+        try:
+            from onnxconverter_common.float16 import convert_float_to_float16
+            model_fp16 = convert_float_to_float16(model, keep_io_types=keep_io_types)
+        except Exception as e:
+            raise RuntimeError(
+                "FP16 conversion requires onnxruntime (transformers.float16) or onnxconverter_common."
+            ) from e
+    onnx.save(model_fp16, dst_onnx_path)
+
+
+def _quantize_onnx_dynamic(src_onnx_path: str, dst_onnx_path: str):
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+    except Exception as e:
+        raise RuntimeError("Dynamic INT8 quantization requires onnxruntime.") from e
+
+    quantize_dynamic(
+        model_input=src_onnx_path,
+        model_output=dst_onnx_path,
+        weight_type=QuantType.QInt8,
+        per_channel=True,
+        reduce_range=False,
+    )
+
+
+class _NpzCalibrationDataReader:
+    def __init__(self, calibration_npz_path: str):
+        try:
+            import numpy as np
+        except Exception as e:
+            raise RuntimeError("Static INT8 quantization requires numpy.") from e
+
+        if not os.path.exists(calibration_npz_path):
+            raise FileNotFoundError(f"未找到静态量化校准文件: {calibration_npz_path}")
+
+        data = np.load(calibration_npz_path)
+        if "input_ids" not in data or "attention_mask" not in data:
+            raise ValueError("校准 npz 必须包含 `input_ids` 和 `attention_mask` 两个键。")
+
+        self.input_ids = data["input_ids"]
+        self.attention_mask = data["attention_mask"]
+        if len(self.input_ids) != len(self.attention_mask):
+            raise ValueError("校准数据 `input_ids` 与 `attention_mask` 样本数量不一致。")
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.input_ids):
+            return None
+        feed = {
+            "input_ids": self.input_ids[self.index:self.index + 1],
+            "attention_mask": self.attention_mask[self.index:self.index + 1],
+        }
+        self.index += 1
+        return feed
+
+    def rewind(self):
+        self.index = 0
+
+
+def _quantize_onnx_static(src_onnx_path: str, dst_onnx_path: str, calibration_npz_path: str):
+    try:
+        from onnxruntime.quantization import quantize_static, QuantType, QuantFormat
+    except Exception as e:
+        raise RuntimeError("Static INT8 quantization requires onnxruntime.") from e
+
+    data_reader = _NpzCalibrationDataReader(calibration_npz_path)
+    quantize_static(
+        model_input=src_onnx_path,
+        model_output=dst_onnx_path,
+        calibration_data_reader=data_reader,
+        quant_format=QuantFormat.QDQ,
+        activation_type=QuantType.QInt8,
+        weight_type=QuantType.QInt8,
+        per_channel=True,
+        reduce_range=False,
+    )
+
+
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _extract_tensor_from_state_value(value: Any) -> Optional[torch.Tensor]:
+    if torch.is_tensor(value):
+        return value.dequantize() if value.is_quantized else value
+
+    if isinstance(value, dict):
+        if "int8" in value and "scale" in value:
+            int8_tensor = value["int8"]
+            scale_tensor = value["scale"]
+            if torch.is_tensor(int8_tensor) and torch.is_tensor(scale_tensor):
+                return int8_tensor.float() * scale_tensor.float()
+
+        preferred_keys = (
+            "tensor",
+            "value",
+            "data",
+            "param",
+            "weight",
+            "bias",
+            "qweight",
+        )
+        for key in preferred_keys:
+            if key in value:
+                tensor = _extract_tensor_from_state_value(value[key])
+                if tensor is not None:
+                    return tensor
+
+        for nested in value.values():
+            tensor = _extract_tensor_from_state_value(nested)
+            if tensor is not None:
+                return tensor
+
+    return None
+
+
+def _normalize_state_dict(raw_checkpoint: Any) -> Dict[str, torch.Tensor]:
+    if not isinstance(raw_checkpoint, dict):
+        raise ValueError("checkpoint 不是 dict，无法解析 state_dict。")
+
+    candidates = (
+        "state_dict",
+        "model_state_dict",
+        "student_state_dict",
+        "model",
+        "net",
+    )
+    state_obj: Any = raw_checkpoint
+    for key in candidates:
+        if key in raw_checkpoint and isinstance(raw_checkpoint[key], dict):
+            state_obj = raw_checkpoint[key]
+            break
+
+    if not isinstance(state_obj, dict):
+        raise ValueError("无法从 checkpoint 中定位 state_dict。")
+
+    normalized: Dict[str, torch.Tensor] = {}
+    for name, value in state_obj.items():
+        tensor = _extract_tensor_from_state_value(value)
+        if tensor is None:
+            raise ValueError(f"参数 `{name}` 不是 Tensor，也无法从嵌套结构中提取 Tensor。")
+        normalized[name] = tensor
+
+    return normalized
+
+
+def _infer_model_dims_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, int]:
+    inferred: Dict[str, int] = {}
+
+    emb_key = "encoder.token_emb.weight"
+    if emb_key in state_dict and state_dict[emb_key].ndim == 2:
+        inferred["vocab_size"] = int(state_dict[emb_key].shape[0])
+
+    cls_w_key = "classifier.weight"
+    if cls_w_key in state_dict and state_dict[cls_w_key].ndim == 2:
+        inferred["num_labels"] = int(state_dict[cls_w_key].shape[0])
+
+    return inferred
+
+
 def convert_to_onnx(
     model_pt_path: str,
-    preprocessor_dir: str,
+    vocab_json_path: str,
     onnx_path: str,
     max_len: int = 1024,
+    quantization_mode: Literal["none", "dynamic", "static"] = "dynamic",
+    int8_onnx_path: Optional[str] = None,
+    calibration_npz_path: Optional[str] = None,
+    export_fp16: bool = True,
+    fp16_onnx_path: Optional[str] = None,
+    export_fp32: bool = True,           # 新增参数
+    fp32_onnx_path: Optional[str] = None # 新增参数
 ):
     """
     加载 PyTorch 模型，并将其转换为 ONNX 格式。
     """
     device = torch.device("cpu")
-    le_path = os.path.join(preprocessor_dir, "label_encoder.pkl")
-    tokenizer_path = os.path.join(preprocessor_dir, "tokenizer.pkl")
 
-    if not os.path.exists(le_path) or not os.path.exists(tokenizer_path):
-        raise FileNotFoundError(f"未找到预处理器文件。请确保已运行 `save_preprocessors.py`。")
+    if not os.path.exists(vocab_json_path):
+        raise FileNotFoundError(f"未找到 vocab.json: {vocab_json_path}")
     
-    with open(le_path, 'rb') as f:
-        le = pickle.load(f)
-    num_labels = len(le.classes_)
-    print(f"LabelEncoder 已加载，类别数量为 {num_labels}。")
-    
-    with open(tokenizer_path, 'rb') as f:
-        tokenizer = pickle.load(f)
-    vocab_size = len(tokenizer.token2id)
-    print(f"分词器已加载，词表大小为 {vocab_size}。")
+    total_steps = 4
+    if quantization_mode != "none":
+        total_steps += 1
+    if export_fp16:
+        total_steps += 1
+    if export_fp32:
+        total_steps += 1
 
-    if max_len <= 0:
-        raise ValueError("max_len 必须大于 0")
-    
-    model = TinyTransformerForClassification(
-        num_labels=num_labels, vocab_size=vocab_size, d_model=128, num_layers=2,
-        num_heads=4, mlp_ratio=4, max_len=max_len
-    ).to(device)
-    model = model.float()
+    with tqdm(total=total_steps, desc="ONNX conversion pipeline", unit="step") as pbar:
+        tokenizer = SimpleCNENTokenizer()
+        tokenizer.load_vocab(vocab_json_path)
+        vocab_size = len(tokenizer.token2id)
+        print(f"词表已加载，词表大小为 {vocab_size}。")
+        pbar.update(1)
 
-    if not os.path.exists(model_pt_path):
-        raise FileNotFoundError(f"未找到 PyTorch 模型文件: {model_pt_path}")
-    
-    model.load_state_dict(torch.load(model_pt_path, map_location=device))
-    model.eval()
+        if max_len <= 0:
+            raise ValueError("max_len 必须大于 0")
+        if quantization_mode not in {"none", "dynamic", "static"}:
+            raise ValueError("quantization_mode 必须是 'none'、'dynamic' 或 'static'")
 
-    dummy_input_ids = torch.randint(0, vocab_size, (1, max_len)).to(device)
-    dummy_attention_mask = torch.ones(1, max_len, dtype=torch.long).to(device)
+        if not os.path.exists(model_pt_path):
+            raise FileNotFoundError(f"未找到 PyTorch 模型文件: {model_pt_path}")
+        raw_checkpoint = torch.load(model_pt_path, map_location=device)
+        state_dict = _normalize_state_dict(raw_checkpoint)
+        inferred_dims = _infer_model_dims_from_state_dict(state_dict)
 
-    try:
-        os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
-        torch.onnx.export(
-            model,
-            (dummy_input_ids, dummy_attention_mask),
-            onnx_path,
-            export_params=True,
-            opset_version=14,
-            do_constant_folding=True,
-            input_names=['input_ids', 'attention_mask'],
-            output_names=['logits', 'pooled_output'],
-            dynamic_axes={
-                'input_ids': {0: 'batch_size', 1: 'seq_len'},
-                'attention_mask': {0: 'batch_size', 1: 'seq_len'}
-            }
-        )
-        print(f"\n模型成功转换为 ONNX 格式，并保存到: {onnx_path}")
-        print("ONNX 模型输入: ['input_ids', 'attention_mask']")
-        print("ONNX 模型输出: ['logits', 'pooled_output']")
-    except Exception as e:
-        print(f"模型转换失败: {e}")
+        effective_vocab_size = inferred_dims.get("vocab_size", vocab_size)
+        effective_num_labels = inferred_dims.get("num_labels")
+        if effective_num_labels is None:
+            raise ValueError("无法从 checkpoint 推断 num_labels（缺少 classifier.weight）。")
+
+        if effective_vocab_size != vocab_size:
+            print(
+                f"警告: tokenizer 词表({vocab_size}) 与 checkpoint 词表({effective_vocab_size}) 不一致，"
+                f"将按 checkpoint 词表构建模型。"
+            )
+            if vocab_size > effective_vocab_size:
+                raise ValueError(
+                    "tokenizer 词表大于 checkpoint embedding 词表，推理时可能发生越界。"
+                    "请使用与该 checkpoint 配套的 vocab.json。"
+                )
+
+        model = TinyTransformerForClassification(
+            num_labels=effective_num_labels, vocab_size=effective_vocab_size, d_model=128, num_layers=2,
+            num_heads=4, mlp_ratio=4, max_len=max_len
+        ).to(device)
+        model = model.float() # 默认 PyTorch 即导出 FP32
+        pbar.update(1)
+
+        model.load_state_dict(state_dict)
+        model.eval()
+
+        dummy_input_ids = torch.randint(0, effective_vocab_size, (1, max_len)).to(device)
+        dummy_attention_mask = torch.ones(1, max_len, dtype=torch.long).to(device)
+        pbar.update(1)
+
+        try:
+            _ensure_parent_dir(onnx_path)
+            torch.onnx.export(
+                model,
+                (dummy_input_ids, dummy_attention_mask),
+                onnx_path,
+                export_params=True,
+                opset_version=14,
+                do_constant_folding=True,
+                input_names=['input_ids', 'attention_mask'],
+                output_names=['logits', 'pooled_output'],
+                dynamic_axes={
+                    'input_ids': {0: 'batch_size', 1: 'seq_len'},
+                    'attention_mask': {0: 'batch_size', 1: 'seq_len'}
+                }
+            )
+            print(f"\n基础模型(FP32)成功转换为 ONNX 格式，暂存/保存到: {onnx_path}")
+            print("ONNX 模型输入: ['input_ids', 'attention_mask']")
+            print("ONNX 模型输出: ['logits', 'pooled_output']")
+            pbar.update(1)
+
+            # ================= 额外导出/提取 FP32 =================
+            if export_fp32:
+                resolved_fp32_onnx_path = fp32_onnx_path
+                if resolved_fp32_onnx_path is None:
+                    if onnx_path.lower().endswith(".onnx"):
+                        resolved_fp32_onnx_path = onnx_path[:-5] + "_fp32.onnx"
+                    else:
+                        resolved_fp32_onnx_path = onnx_path + "_fp32.onnx"
+                try:
+                    _ensure_parent_dir(resolved_fp32_onnx_path)
+                    if onnx_path != resolved_fp32_onnx_path:
+                        shutil.copy(onnx_path, resolved_fp32_onnx_path)
+                    print(f"FP32 ONNX 已保存到: {resolved_fp32_onnx_path}")
+                except Exception as e:
+                    print(f"FP32 ONNX 保存失败: {e}")
+                pbar.update(1)
+
+            # ================= 量化为 INT8 =================
+            if quantization_mode != "none":
+                resolved_int8_onnx_path = int8_onnx_path
+                if resolved_int8_onnx_path is None:
+                    if onnx_path.lower().endswith(".onnx"):
+                        resolved_int8_onnx_path = onnx_path[:-5] + "_int8.onnx"
+                    else:
+                        resolved_int8_onnx_path = onnx_path + "_int8.onnx"
+
+                try:
+                    if quantization_mode == "dynamic":
+                        _ensure_parent_dir(resolved_int8_onnx_path)
+                        _quantize_onnx_dynamic(onnx_path, resolved_int8_onnx_path)
+                    else:
+                        if not calibration_npz_path:
+                            raise ValueError("静态量化需要提供 calibration_npz_path")
+                        _ensure_parent_dir(resolved_int8_onnx_path)
+                        _quantize_onnx_static(onnx_path, resolved_int8_onnx_path, calibration_npz_path)
+                    print(f"INT8 ONNX 已保存到: {resolved_int8_onnx_path} (mode={quantization_mode})")
+                except Exception as e:
+                    print(f"INT8 ONNX 转换失败: {e}")
+                pbar.update(1)
+            
+            # ================= 转换为 FP16 =================
+            if export_fp16:
+                resolved_fp16_onnx_path = fp16_onnx_path
+                if resolved_fp16_onnx_path is None:
+                    if onnx_path.lower().endswith(".onnx"):
+                        resolved_fp16_onnx_path = onnx_path[:-5] + "_fp16.onnx"
+                    else:
+                        resolved_fp16_onnx_path = onnx_path + "_fp16.onnx"
+                try:
+                    _ensure_parent_dir(resolved_fp16_onnx_path)
+                    _convert_onnx_to_fp16(onnx_path, resolved_fp16_onnx_path, keep_io_types=True)
+                    print(f"FP16 ONNX 已保存到: {resolved_fp16_onnx_path}")
+                except Exception as e:
+                    print(f"FP16 ONNX 转换失败: {e}")
+                pbar.update(1)
+        except Exception as e:
+            print(f"模型转换失败: {e}")
 
 if __name__ == "__main__":
     max_len = 1500
-    model_pt_path = "test_model/result/tiny_student_state_dict.pt"
-    preprocessor_folder = "preprocessors"
-    onnx_path = "test_model/result/tiny_student_state_dict.onnx"
+    quantization_mode = "dynamic"   # 可选: "none" | "dynamic" | "static"
+    export_fp16 = True              # 是否额外导出 FP16 ONNX
+    export_fp32 = True              # 是否额外保存 FP32 ONNX
+    calibration_npz_path = None     # static 模式下必填，需包含 input_ids/attention_mask
+    int8_onnx_path = "tiny_student_state_dict_int8.onnx"            # None 时自动按 onnx_path 生成 *_int8.onnx
+    fp16_onnx_path = "tiny_student_state_dict_fp16.onnx"            # None 时自动按 onnx_path 生成 *_fp16.onnx
+    fp32_onnx_path = "tiny_student_state_dict_fp32.onnx"            # None 时自动按 onnx_path 生成 *_fp32.onnx
+    model_pt_path = "test_zl/260327_1500fp32/model/tiny_student_state_dict.pt"
+    vocab_json_path = "test_zl/260327_1500fp32/soft_labels/vocab.json"
+    onnx_path = "tiny_student_state_dict.onnx"
     
     try:
         convert_to_onnx(
             model_pt_path,
-            preprocessor_folder,
+            vocab_json_path,
             onnx_path,
             max_len=max_len,
+            quantization_mode=quantization_mode,
+            int8_onnx_path=int8_onnx_path,
+            calibration_npz_path=calibration_npz_path,
+            export_fp16=export_fp16,
+            fp16_onnx_path=fp16_onnx_path,
+            export_fp32=export_fp32,          # 传入 FP32 开关
+            fp32_onnx_path=fp32_onnx_path     # 传入 FP32 路径
         )
     except FileNotFoundError as e:
         print(f"错误: {e}")
