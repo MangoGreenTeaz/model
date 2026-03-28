@@ -106,12 +106,15 @@ def evaluate_onnx(
     if label_col not in df.columns:
         raise ValueError(f"label_col `{label_col}` not found in CSV columns: {list(df.columns)}")
 
-    eval_df = df[[text_col, label_col]].dropna().copy()
-    if eval_df.empty:
+    text_series = pd.Series(df[text_col], index=df.index)
+    label_series = pd.Series(df[label_col], index=df.index)
+    eval_df = pd.DataFrame({text_col: text_series, label_col: label_series})
+    metric_mask = pd.Series(pd.notna(text_series) & pd.notna(label_series), index=df.index)
+    metric_df = eval_df.loc[metric_mask].copy()
+    if metric_df.empty:
         raise ValueError("No valid rows after dropping NA in text/label columns.")
 
-    texts = eval_df[text_col].astype(str).tolist()
-    true_labels = eval_df[label_col].astype(str).tolist()
+    texts = df[text_col].fillna("").astype(str).tolist()
 
     encoded_rows = []
     for text in tqdm(texts, desc="Encoding test samples", unit="sample"):
@@ -142,14 +145,24 @@ def evaluate_onnx(
         y_pred_ids.extend(batch_pred_ids.tolist())
 
     y_pred_labels = label_encoder.inverse_transform(np.asarray(y_pred_ids, dtype=np.int64)).astype(str).tolist()
+    pred_label_series = pd.Series(y_pred_labels, index=df.index)
 
     labels_for_report = label_encoder.classes_.astype(str).tolist()
-    acc = accuracy_score(true_labels, y_pred_labels)
-    f1_macro = f1_score(true_labels, y_pred_labels, average="macro")
-    f1_weighted = f1_score(true_labels, y_pred_labels, average="weighted")
+    metric_label_series = pd.Series(metric_df[label_col], index=metric_df.index)
+    known_mask = metric_label_series.astype(str).isin(list(labels_for_report))
+    metric_df = metric_df.loc[known_mask].copy()
+    if metric_df.empty:
+        raise ValueError("No overlapping labels found between test set and label encoder.")
+
+    metric_true_labels = metric_label_series.loc[known_mask].astype(str).tolist()
+    metric_pred_labels = pred_label_series.loc[metric_df.index].tolist()
+
+    acc = accuracy_score(metric_true_labels, metric_pred_labels)
+    f1_macro = f1_score(metric_true_labels, metric_pred_labels, average="macro")
+    f1_weighted = f1_score(metric_true_labels, metric_pred_labels, average="weighted")
     report_dict = classification_report(
-        true_labels,
-        y_pred_labels,
+        metric_true_labels,
+        metric_pred_labels,
         labels=labels_for_report,
         target_names=labels_for_report,
         output_dict=True,
@@ -167,7 +180,7 @@ def evaluate_onnx(
         "batch_size": batch_size,
         "use_gpu": use_gpu,
         "active_providers": active_providers,
-        "samples": int(len(true_labels)),
+        "samples": int(len(metric_df)),
         "accuracy": float(acc),
         "f1_macro": float(f1_macro),
         "f1_weighted": float(f1_weighted),
@@ -183,12 +196,12 @@ def evaluate_onnx(
     pred_dir = os.path.dirname(pred_csv_path)
     if pred_dir:
         os.makedirs(pred_dir, exist_ok=True)
-    out_df = eval_df.copy()
-    out_df["predicted_label"] = y_pred_labels
-    out_df["is_correct"] = (out_df[label_col].astype(str) == out_df["predicted_label"]).astype(int)
+    out_df = df.copy()
+    out_df["predicted_label"] = pred_label_series.values
+    out_df["is_correct"] = (out_df[label_col].astype(str) == out_df["predicted_label"]).map({True: "true", False: "false"})
     out_df.to_csv(pred_csv_path, index=False, encoding="utf-8-sig")
 
-    print(f"Evaluation finished. samples={len(true_labels)}")
+    print(f"Evaluation finished. samples={len(metric_df)}")
     print(f"accuracy={acc:.6f}, f1_macro={f1_macro:.6f}, f1_weighted={f1_weighted:.6f}")
     print(f"Report JSON: {report_json_path}")
     print(f"Predictions CSV: {pred_csv_path}")

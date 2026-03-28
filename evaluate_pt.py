@@ -163,14 +163,16 @@ def evaluate_student_pt(
     if label_col not in df.columns:
         raise ValueError(f"label_col `{label_col}` not found in csv columns: {list(df.columns)}")
 
-    eval_df = df[[text_col, label_col]].dropna().copy()
-    if eval_df.empty:
+    text_series = pd.Series(df[text_col], index=df.index)
+    label_series = pd.Series(df[label_col], index=df.index)
+    eval_df = pd.DataFrame({text_col: text_series, label_col: label_series})
+    metric_mask = pd.Series(pd.notna(text_series) & pd.notna(label_series), index=df.index)
+    metric_df = eval_df.loc[metric_mask].copy()
+    if metric_df.empty:
         raise ValueError("no valid rows after dropping NA")
 
-    texts = eval_df[text_col].astype(str).tolist()
-    true_labels = eval_df[label_col].astype(str).tolist()
-
     encoded_rows = []
+    texts = df[text_col].fillna("").astype(str).tolist()
     for text in tqdm(texts, desc="Encoding test samples", unit="sample"):
         encoded_rows.append(tokenizer.encode(text, max_len=max_len))
     input_ids = np.asarray(encoded_rows, dtype=np.int64)
@@ -207,10 +209,10 @@ def evaluate_student_pt(
     ).to(device)
     model = model.float()
     model.load_state_dict(state_dict)
-    model.eval List[int] = []
-()
+    model.eval()
 
-    pred_ids:    with torch.no_grad():
+    pred_ids: List[int] = []
+    with torch.no_grad():
         for start in tqdm(range(0, len(input_ids), batch_size), desc="PT inference", unit="batch"):
             end = start + batch_size
             batch_input_ids = torch.from_numpy(input_ids[start:end]).to(device)
@@ -230,16 +232,18 @@ def evaluate_student_pt(
             pred_labels.append(f"__out_of_range_{idx}")
             valid_pred_ids.append(-1)
 
-    known_set = set(classes)
-    filtered_true_ids: List[int] = []
-    filtered_pred_ids: List[int] = []
-    for label, pred_id in zip(true_labels, valid_pred_ids):
-        if label in known_set:
-            filtered_true_ids.append(int(label_encoder.transform([label])[0]))
-            filtered_pred_ids.append(int(pred_id))
+    pred_id_series = pd.Series(valid_pred_ids, index=df.index)
+    pred_label_series = pd.Series(pred_labels, index=df.index)
 
-    if not filtered_true_ids:
+    known_set = set(classes)
+    metric_label_series = pd.Series(metric_df[label_col], index=metric_df.index)
+    known_mask = metric_label_series.astype(str).isin(list(known_set))
+    metric_df = metric_df.loc[known_mask].copy()
+    if metric_df.empty:
         raise ValueError("测试集标签与当前 LabelEncoder 无交集，无法评估。")
+
+    filtered_true_ids = label_encoder.transform(metric_label_series.loc[known_mask].astype(str).tolist()).tolist()
+    filtered_pred_ids = pred_id_series.loc[metric_df.index].tolist()
 
     acc = accuracy_score(filtered_true_ids, filtered_pred_ids)
     f1_macro = f1_score(filtered_true_ids, filtered_pred_ids, average="macro")
@@ -281,12 +285,11 @@ def evaluate_student_pt(
     if pred_dir:
         os.makedirs(pred_dir, exist_ok=True)
     out_df = df.copy()  # 使用原始的df，保留所有列
-    out_df["predicted_label"] = pred_labels
-    out_df["is_correct"] = out_df[label_col].astype(str) == out_df["predicted_label"]
-    out_df["is_correct"] = out_df["is_correct"].map({True: "true", False: "false"})
+    out_df["predicted_label"] = pred_label_series.values
+    out_df["is_correct"] = (out_df[label_col].astype(str) == out_df["predicted_label"]).map({True: "true", False: "false"})
     out_df.to_csv(pred_csv_path, index=False, encoding="utf-8-sig")
 
-    print(f"Samples: {len(true_labels)}")
+    print(f"Samples: {len(metric_df)}")
     print(f"Accuracy: {acc:.6f}")
     print(f"F1(macro): {f1_macro:.6f}, F1(weighted): {f1_weighted:.6f}")
     print(f"Report JSON: {report_json_path}")
