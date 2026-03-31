@@ -48,8 +48,10 @@ def _wrap_dataparallel(model: nn.Module) -> nn.Module:
 
 def _state_dict_for_save(model: nn.Module) -> dict:
     if isinstance(model, nn.DataParallel):
-        return model.module.state_dict()
-    return model.state_dict()
+        sd = model.module.state_dict()
+    else:
+        sd = model.state_dict()
+    return {k: v.cpu() for k, v in sd.items()}
 
 
 def _load_state_dict_safely(model: nn.Module, state_dict: dict):
@@ -204,7 +206,7 @@ class MultiheadSelfAttentionALiBi(nn.Module):
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         pos = torch.arange(T, device=x.device)
-        rel = pos[None, :] - pos[:, None]
+        rel = -torch.abs(pos[None, :] - pos[:, None])
         rel = rel.unsqueeze(0).unsqueeze(0)
         alibi = self.slopes * rel
         attn_scores = attn_scores + alibi
